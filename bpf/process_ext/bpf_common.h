@@ -8,12 +8,44 @@
  * References maps and flags defined in the glue file.
  */
 
+/*
+ * A process is tracked if its PID is in tracked_pids or any of its ancestors
+ * (up to 8 levels) is. A match via an ancestor is cached in tracked_pids, so
+ * descendants are covered from their first syscall, before user space has
+ * seen their EXEC event. This matters when a tracked process starts children
+ * in a new session (e.g. an agent's shell tool calling setsid()): they are
+ * still descendants even though they fail a --session check. User space
+ * removes the entry when it processes the EXIT event.
+ */
 static __always_inline bool is_pid_tracked(void)
 {
+	struct task_struct *task;
+	u8 present = 1;
+
 	if (!filter_pids)
 		return true;  /* no filter mode: trace all */
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
-	return bpf_map_lookup_elem(&tracked_pids, &pid) != NULL;
+	if (bpf_map_lookup_elem(&tracked_pids, &pid))
+		return true;
+
+	task = (struct task_struct *)bpf_get_current_task();
+#pragma unroll
+	for (int i = 0; i < 8; i++) {
+		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+		u32 ppid;
+
+		if (!parent)
+			break;
+		ppid = BPF_CORE_READ(parent, tgid);
+		if (!ppid || ppid == pid)
+			break;
+		if (bpf_map_lookup_elem(&tracked_pids, &ppid)) {
+			bpf_map_update_elem(&tracked_pids, &pid, &present, BPF_ANY);
+			return true;
+		}
+		task = parent;
+	}
+	return false;
 }
 
 static __always_inline bool is_cgroup_tracked(void)

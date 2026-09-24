@@ -330,6 +330,16 @@ static bool process_in_target_session(pid_t pid)
 	return getsid(pid) == env.session_id;
 }
 
+static bool bpf_pid_tracked(pid_t pid)
+{
+	uint32_t bpf_pid = (uint32_t)pid;
+	uint8_t present;
+
+	if (g_tracked_pids_fd < 0 || pid <= 0)
+		return false;
+	return bpf_map_lookup_elem(g_tracked_pids_fd, &bpf_pid, &present) == 0;
+}
+
 static bool should_track_event_process(struct pid_tracker *tracker,
 				       const char *comm,
 				       pid_t pid,
@@ -337,8 +347,12 @@ static bool should_track_event_process(struct pid_tracker *tracker,
 {
 	if (process_in_target_session(pid))
 		return true;
-	if (env.session_id > 0)
-		return false;
+	if (env.session_id > 0) {
+		/* Also follow descendants of tracked processes that started a new
+		 * session (e.g. an agent's shell tool). The kernel caches such
+		 * descendants in tracked_pids (see is_pid_tracked()). */
+		return pid_tracker_is_tracked(tracker, ppid) || bpf_pid_tracked(pid);
+	}
 	return should_track_process(tracker, comm, pid, ppid);
 }
 

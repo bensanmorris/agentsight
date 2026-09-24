@@ -82,6 +82,10 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	pid = bpf_get_current_pid_tgid() >> 32;
 	task = (struct task_struct *)bpf_get_current_task();
 
+	/* Cache descendants of tracked PIDs in tracked_pids at exec time so user
+	 * space can follow children that left the target session. */
+	is_pid_tracked();
+
 	/* remember time exec() was executed for this PID */
 	ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&exec_start, &pid, &ts, BPF_ANY);
