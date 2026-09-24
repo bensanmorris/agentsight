@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "process.h"
 #include "process.skel.h"
 #include "process_utils.h"
@@ -492,6 +493,11 @@ static uint64_t hash_file_open(const struct event *e)
 {
 	uint64_t hash = 5381;
 	hash = ((hash << 5) + hash) + e->pid;
+	/* Include the open's write intent so a read-only open (e.g. an existence
+	 * check that fails with ENOENT) does not swallow a later write-open of the
+	 * same path within the dedup window. */
+	hash = ((hash << 5) + hash) +
+	       (uint32_t)(e->file_op.flags & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND));
 	
 	// Hash the filepath for FILE_OPEN events
 	const char *str = e->file_op.filepath;
