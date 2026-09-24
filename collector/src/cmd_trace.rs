@@ -627,7 +627,11 @@ pub(crate) fn add_http_analyzers(
     http_filter: &[String],
     disable_auth_removal: bool,
 ) -> BinaryRunner {
-    let mut runner = runner.add_analyzer(Box::new(SSEProcessor::new_with_timeout(30000)));
+    // Connection-tracked SSL events (sslsniff conn_id) are reassembled by the
+    // HTTP parser; the pre-parser SSE merge only handles untracked ones.
+    let mut runner = runner.add_analyzer(Box::new(
+        SSEProcessor::new_with_timeout(30000).defer_connection_tracked_ssl(),
+    ));
     let parser = if include_raw_data {
         HTTPParser::new()
     } else {

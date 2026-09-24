@@ -22,7 +22,11 @@ impl HTTPDecompressor {
         if event.source != "http_parser" {
             return event;
         }
-        if event.data.get("message_type").and_then(Value::as_str) != Some("response") {
+        // Requests too: Claude Code gzips its /v1/messages request bodies.
+        if !matches!(
+            event.data.get("message_type").and_then(Value::as_str),
+            Some("request" | "response")
+        ) {
             return event;
         }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 eunomia-bpf org.
 
+use super::http1_stream::{Feed, Http1Message, Http1Tracker};
 use super::protocol_events::HTTPEvent;
 use super::{Analyzer, AnalyzerError};
 use crate::event::Event;
@@ -22,6 +23,7 @@ pub struct HTTPParser {
     include_raw_data: bool,
     http2: HTTP2State,
     websocket: WebSocketState,
+    http1: Http1Tracker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +119,7 @@ impl HTTPParser {
             include_raw_data: true,
             http2: HTTP2State::default(),
             websocket: WebSocketState::default(),
+            http1: Http1Tracker::default(),
         }
     }
 
@@ -297,12 +300,15 @@ impl HTTPParser {
             content_length,
             original_source: "ssl".to_string(),
             raw_data: include_raw_data.then_some(parsed_message.raw_data),
+            conn_id: None,
+            thread_tid: None,
         }
         .to_event(original_event)
     }
 
     /// Handle SSL events (HTTP request/response data)
     fn handle_ssl_event(
+        http1: &mut Http1Tracker,
         http2: &mut HTTP2State,
         websocket: &mut WebSocketState,
         event: Event,
@@ -314,6 +320,25 @@ impl HTTPParser {
             Some(s) => s,
             None => return vec![event],
         };
+
+        // With a connection id, frame HTTP/1.x across events of that
+        // connection only (several connections can share one thread).
+        let conn_id = ssl_data.get("conn_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        if conn_id != 0 {
+            let bytes = ssl_event_bytes(ssl_data, data_str);
+            let rw = u8::from(
+                ssl_data
+                    .get("function")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|f| f.starts_with("WRITE")),
+            );
+            if let Feed::Consumed(messages) = http1.feed(&event, conn_id, rw, &bytes) {
+                return messages
+                    .into_iter()
+                    .filter_map(|m| create_http1_event(m, conn_id, websocket, include_raw_data))
+                    .collect();
+            }
+        }
 
         // Only process if it's HTTP data AND can be parsed as a complete HTTP message
         if Self::is_http_data(data_str)
@@ -329,11 +354,7 @@ impl HTTPParser {
             )];
         }
 
-        let data_bytes = ssl_data
-            .get("data_hex")
-            .and_then(|v| v.as_str())
-            .and_then(|v| hex::decode(v).ok())
-            .unwrap_or_else(|| ssl_json_string_to_bytes(data_str));
+        let data_bytes = ssl_event_bytes(ssl_data, data_str);
         if let Some(events) = websocket.handle_event(&event, &data_bytes, include_raw_data) {
             return events;
         }
@@ -476,6 +497,8 @@ fn create_websocket_request_event(
         total_size: headers_size(headers) + body.len(),
         original_source: "ssl.websocket".to_string(),
         raw_data: include_raw_data.then(|| body.clone()),
+        conn_id: None,
+        thread_tid: None,
         body: Some(body),
     }
     .to_event(original_event)
@@ -801,6 +824,8 @@ fn create_http2_request_event(
         original_source: "ssl.http2".to_string(),
         raw_data: include_raw_data
             .then(|| String::from_utf8_lossy(&state.request_body).to_string()),
+        conn_id: None,
+        thread_tid: None,
     }
     .to_event(original_event)
 }
@@ -840,6 +865,8 @@ fn create_http2_response_event(
         original_source: "ssl.http2".to_string(),
         raw_data: include_raw_data
             .then(|| String::from_utf8_lossy(&state.response_body).to_string()),
+        conn_id: None,
+        thread_tid: None,
     }
     .to_event(original_event)
 }
@@ -859,6 +886,69 @@ fn body_string(body: &[u8]) -> Option<String> {
 
 fn headers_size(headers: &HashMap<String, String>) -> usize {
     headers.iter().map(|(k, v)| k.len() + v.len()).sum()
+}
+
+/// Exact payload bytes of an sslsniff event: `data_hex` when present (the JSON
+/// text form can't round-trip bytes >= 0x80), else the text form.
+fn ssl_event_bytes(ssl_data: &serde_json::Value, data_str: &str) -> Vec<u8> {
+    ssl_data
+        .get("data_hex")
+        .and_then(|v| v.as_str())
+        .and_then(|v| hex::decode(v).ok())
+        .unwrap_or_else(|| ssl_json_string_to_bytes(data_str))
+}
+
+/// Build the http_parser event for a message reassembled from one connection.
+/// `tid` carries the connection id so that request/response pairing and SSE
+/// merging stay per connection; the real thread id goes in `thread_tid`.
+fn create_http1_event(
+    message: Http1Message,
+    conn_id: u64,
+    websocket: &mut WebSocketState,
+    include_raw_data: bool,
+) -> Option<Event> {
+    let head = String::from_utf8_lossy(&message.head).into_owned();
+    let parsed = HTTPParser::parse_http_message(&format!("{head}\r\n\r\n"))?;
+    websocket.observe_handshake(&message.first_event, &parsed);
+    let mut headers = parsed.headers;
+    if message.was_chunked {
+        // The body below is already de-chunked.
+        headers.retain(|k, _| !k.eq_ignore_ascii_case("transfer-encoding"));
+    }
+    let body_bytes = message.body;
+    let body = (!body_bytes.is_empty()).then(|| String::from_utf8_lossy(&body_bytes).into_owned());
+    let message_type = match parsed.message_type {
+        HTTPMessageType::Request => "request",
+        HTTPMessageType::Response => "response",
+    };
+    let mut event = HTTPEvent {
+        tid: conn_id,
+        message_type: message_type.to_string(),
+        first_line: parsed.first_line,
+        method: parsed.method,
+        path: parsed.path,
+        protocol: parsed.protocol,
+        status_code: parsed.status_code,
+        status_text: parsed.status_text,
+        headers,
+        has_body: body.is_some(),
+        body_hex: body.as_ref().map(|_| hex::encode(&body_bytes)),
+        body,
+        total_size: message.head.len() + 4 + body_bytes.len(),
+        is_chunked: false,
+        content_length: Some(body_bytes.len()),
+        original_source: "ssl.http1".to_string(),
+        raw_data: include_raw_data
+            .then(|| format!("{head}\r\n\r\n{}", String::from_utf8_lossy(&body_bytes))),
+        conn_id: Some(conn_id),
+        thread_tid: message.first_event.data.get("tid").and_then(|v| v.as_u64()),
+    }
+    .to_event(&message.first_event);
+    if message_type == "response" {
+        // A response (e.g. an SSE stream) ends when its last byte arrives.
+        event.timestamp = message.last_timestamp;
+    }
+    Some(event)
 }
 
 fn ssl_json_string_to_bytes(data: &str) -> Vec<u8> {
@@ -881,10 +971,17 @@ impl Analyzer for HTTPParser {
         let include_raw_data = self.include_raw_data;
         let mut http2 = std::mem::take(&mut self.http2);
         let mut websocket = std::mem::take(&mut self.websocket);
+        let mut http1 = std::mem::take(&mut self.http1);
 
         let processed_stream = stream.flat_map(move |event| {
             let events = if event.source == "ssl" {
-                Self::handle_ssl_event(&mut http2, &mut websocket, event, include_raw_data)
+                Self::handle_ssl_event(
+                    &mut http1,
+                    &mut http2,
+                    &mut websocket,
+                    event,
+                    include_raw_data,
+                )
             } else {
                 vec![event]
             };
@@ -1175,6 +1272,197 @@ sec-websocket-extensions: permessage-deflate\r\n\r\n"
         assert_eq!(calls[0].session_id.as_deref(), Some("sess-h2"));
         assert_eq!(calls[0].call_kind.as_deref(), Some("chat"));
         assert_eq!(calls[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// sslsniff event as emitted with connection tracking: exact bytes in
+    /// data_hex, and a `data` text form that must not be relied on.
+    fn tracked_ssl_event(ts: u64, function: &str, conn_id: u64, bytes: &[u8]) -> Event {
+        Event::new_with_timestamp(
+            ts,
+            "ssl".to_string(),
+            4242,
+            "HTTP Client".to_string(),
+            json!({
+                "tid": 7,
+                "conn_id": conn_id,
+                "function": function,
+                "len": bytes.len(),
+                "buf_size": bytes.len(),
+                "data": "<lossy text form>",
+                "data_hex": hex::encode(bytes),
+            }),
+        )
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn chunked(body: &[u8], chunk: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in body.chunks(chunk) {
+            out.extend(format!("{:x}\r\n", part.len()).into_bytes());
+            out.extend(part);
+            out.extend(b"\r\n");
+        }
+        out.extend(b"0\r\n\r\n");
+        out
+    }
+
+    /// The Claude Code shape captured live on 2.1.281: gzip request split over
+    /// 16 KB writes, chunked gzip SSE response, and another connection's
+    /// traffic interleaved on the same thread.
+    #[tokio::test]
+    async fn claude_code_http1_gzip_capture_reaches_materialized_view() {
+        const API: u64 = 0x5555_0000_1000;
+        const MCP: u64 = 0x5555_0000_2000;
+        let prompt = format!("Reply with: café naïve £5 © {}", "x".repeat(60_000));
+        let request_json = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 64,
+            "metadata": {"user_id": "user_abc_account_def_session_sess-claude"},
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        .to_string();
+        let request_body = gzip(request_json.as_bytes());
+        let mut request = format!(
+            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            request_body.len()
+        )
+        .into_bytes();
+        request.extend(&request_body);
+
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":6,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":200,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"café naïve £5 ©\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response_body = chunked(&gzip(sse.as_bytes()), 40);
+        let mut response_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nrequest-id: req_01\r\n\r\n".to_vec();
+        let split = response_body.len() / 2;
+        response_head.extend(&response_body[..split]);
+
+        let mcp_request = b"POST /v1/mcp/srv HTTP/1.1\r\nHost: mcp-proxy.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let mcp_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n1d\r\nevent: message\ndata: {\"id\":1}\n\n\r\n0\r\n\r\n";
+
+        let mut events = Vec::new();
+        for (i, part) in request.chunks(16_384).enumerate() {
+            events.push(tracked_ssl_event(10 + i as u64, "WRITE/SEND", API, part));
+        }
+        events.push(tracked_ssl_event(50, "WRITE/SEND", MCP, mcp_request));
+        events.push(tracked_ssl_event(60, "READ/RECV", API, &response_head));
+        events.push(tracked_ssl_event(70, "READ/RECV", MCP, mcp_response));
+        events.push(tracked_ssl_event(80, "READ/RECV", API, &response_body[split..]));
+        // Claude's Datadog telemetry for the same call (must not be counted
+        // again) and for a call whose response wasn't captured (fallback).
+        const DD: u64 = 0x5555_0000_3000;
+        let telemetry = json!([
+            {"message": "tengu_api_success", "model": "claude-opus-5-5", "input_tokens": 6, "output_tokens": 9, "cached_input_tokens": 300},
+            {"message": "tengu_api_success", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 0},
+        ])
+        .to_string();
+        let mut dd = format!(
+            "POST /api/v2/logs HTTP/1.1\r\nHost: http-intake.logs.us5.datadoghq.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            telemetry.len()
+        )
+        .into_bytes();
+        dd.extend(telemetry.as_bytes());
+        events.push(tracked_ssl_event(90, "WRITE/SEND", DD, &dd));
+
+        let input: EventStream = Box::pin(stream::iter(events));
+        let mut pre_sse = SSEProcessor::new().defer_connection_tracked_ssl();
+        let staged = pre_sse.process(input).await.unwrap();
+        let mut parser = HTTPParser::new().disable_raw_data();
+        let parsed = parser.process(staged).await.unwrap();
+        let mut decompressor = HTTPDecompressor::new();
+        let decompressed = decompressor.process(parsed).await.unwrap();
+        let mut sse_processor = SSEProcessor::new();
+        let output: Vec<Event> = sse_processor.process(decompressed).await.unwrap().collect().await;
+
+        // No raw SSL fragments leak through; each message comes out once.
+        assert!(output.iter().all(|e| e.source != "ssl"), "raw ssl events left: {output:?}");
+        let llm_request = output
+            .iter()
+            .find(|e| e.data["path"] == "/v1/messages?beta=true")
+            .expect("reassembled /v1/messages request");
+        assert_eq!(llm_request.data["decompressed"], true);
+        assert_eq!(llm_request.data["tid"], API);
+        assert_eq!(llm_request.data["thread_tid"], 7);
+        let body: serde_json::Value =
+            serde_json::from_str(llm_request.data["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["messages"][0]["content"], prompt);
+        let merged = output
+            .iter()
+            .find(|e| e.source == "sse_processor" && e.data["tid"] == API)
+            .expect("merged SSE response on the API connection");
+        assert!(merged.data.to_string().contains("café naïve £5 ©"));
+
+        let mut view = MaterializedView::new();
+        for event in &output {
+            view.ingest_event(event).unwrap();
+        }
+        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 0 });
+        assert_eq!(snapshot.summary.llm_calls, 1, "{:?}", snapshot.summary);
+        // The captured call once (response usage, telemetry copy skipped), plus
+        // the telemetry-only call.
+        assert_eq!(snapshot.summary.token_usage_rows, 2, "{:?}", snapshot.summary);
+        assert_eq!(snapshot.summary.input_tokens, 6 + 1);
+        assert_eq!(snapshot.summary.output_tokens, 9 + 2);
+        assert_eq!(snapshot.summary.total_tokens, 315 + 3); // 6 + 100 cache write + 200 cache read + 9, + 1 + 2
+        let calls = view.llm_call_rows(10);
+        assert_eq!(calls[0].status, "complete");
+        assert_eq!(calls[0].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(calls[0].finish_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// Rate-limited call followed by other traffic on the same keep-alive
+    /// connection: the 429 (with Anthropic's `request-id` header) must close
+    /// the pending call, and the later response must not be taken for it.
+    #[tokio::test]
+    async fn rate_limited_call_pairs_and_later_traffic_stays_separate() {
+        const API: u64 = 0x5555_0000_4000;
+        let body = json!({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        let request = format!(
+            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nx-client-request-id: client-1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let error = r#"{"type":"error","error":{"type":"rate_limit_error","message":"limit"},"request_id":"req_429"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nrequest-id: req_429\r\nContent-Length: {}\r\n\r\n{error}",
+            error.len()
+        );
+        let batch = r#"{"events":[]}"#;
+        let log_request = format!(
+            "POST /api/event_logging/v2/batch HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{batch}",
+            batch.len()
+        );
+        let accepted = r#"{"accepted_count":1,"rejected_count":0}"#;
+        let log_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nrequest-id: req_log\r\nContent-Length: {}\r\n\r\n{accepted}",
+            accepted.len()
+        );
+        let input: EventStream = Box::pin(stream::iter(vec![
+            tracked_ssl_event(10, "WRITE/SEND", API, request.as_bytes()),
+            tracked_ssl_event(20, "READ/RECV", API, response.as_bytes()),
+            tracked_ssl_event(30, "WRITE/SEND", API, log_request.as_bytes()),
+            tracked_ssl_event(40, "READ/RECV", API, log_response.as_bytes()),
+        ]));
+        let mut parser = HTTPParser::new().disable_raw_data();
+        let output: Vec<Event> = parser.process(input).await.unwrap().collect().await;
+        let mut view = MaterializedView::new();
+        for event in &output {
+            view.ingest_event(event).unwrap();
+        }
+        let calls = view.llm_call_rows(10);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].status, "error");
+        assert_eq!(calls[0].status_code, Some(429));
+        assert_eq!(calls[0].model.as_deref(), Some("claude-opus-5-5"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::sources::agent_native;
 use crate::text::{clean_prompt_text, extract_prompt_text, truncate_text};
 use crate::view::MaterializedView;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 const PROMPT_DEDUP_WINDOW_MS: u64 = 10_000;
@@ -77,7 +77,23 @@ fn load_view_inner(
     if include_observed_session_prompts {
         import_observed_process_nodes(&mut view, &llm_rows, &process_pids);
         let observed_sessions = agent_native::observed_sessions_from_audit_rows(&audit_rows);
-        agent_native::import_into_view(&mut view, &observed_sessions);
+        // Sessions whose process already has LLM calls captured from its API
+        // traffic contribute their session and tool rows only; the transcript's
+        // LLM/token totals would duplicate those calls.
+        let traffic_llm_pids: HashSet<u32> = llm_rows
+            .iter()
+            .filter(|row| row.view_source != crate::model::AGENT_NATIVE_SOURCE)
+            .filter_map(|row| row.pid)
+            .collect();
+        for session in &observed_sessions {
+            let one = std::slice::from_ref(session);
+            let writers = agent_native::transcript_writer_pids(session, &audit_rows);
+            if writers.iter().any(|pid| traffic_llm_pids.contains(pid)) {
+                agent_native::import_into_view_without_usage(&mut view, one);
+            } else {
+                agent_native::import_into_view(&mut view, one);
+            }
+        }
         let current_llm_rows = view.llm_call_rows(usize::MAX);
         let mut prompt_rows = llm_call_prompt_rows(&current_llm_rows);
         let mut local_prompt_rows = agent_native::observed_session_prompt_rows(&audit_rows);

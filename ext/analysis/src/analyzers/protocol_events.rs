@@ -71,6 +71,12 @@ pub struct HTTPEvent {
     pub content_length: Option<usize>,
     pub original_source: String,
     pub raw_data: Option<String>,
+    /// TLS connection the message was reassembled from (sslsniff `conn_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_id: Option<u64>,
+    /// Real thread id when `tid` holds a per-connection synthetic id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_tid: Option<u64>,
 }
 
 impl HTTPEvent {

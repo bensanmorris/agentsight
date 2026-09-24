@@ -41,6 +41,9 @@ pub struct MaterializedView {
     audit_order: VecDeque<String>,
     sinks: Vec<Box<dyn ViewSink>>,
     pending: HashMap<(u32, u64), VecDeque<PendingRequest>>,
+    /// Usage already taken from API responses, per (pid, input, output), so
+    /// Claude's own telemetry copy of the same call isn't counted again.
+    response_usage_seen: HashMap<(u32, i64, i64), u32>,
     active_processes: HashMap<u32, String>,
     counts: ViewCounts,
     start_timestamp_ms: Option<u64>,
@@ -98,6 +101,7 @@ impl MaterializedView {
             audit_order: self.audit_order.clone(),
             sinks: Vec::new(),
             pending: self.pending.clone(),
+            response_usage_seen: self.response_usage_seen.clone(),
             active_processes: self.active_processes.clone(),
             counts: self.counts.clone(),
             start_timestamp_ms: self.start_timestamp_ms,

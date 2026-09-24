@@ -118,10 +118,15 @@ impl MaterializedView {
         resp: &CanonicalEvent,
     ) -> Option<(PendingRequest, f32)> {
         let requests = self.pending.get_mut(&(pid, tid))?;
-        let (req, confidence) = if let Some(resp_request_id) = resp.request_id.as_deref() {
-            let pos = requests
+        // A response id that matches no pending request (e.g. Anthropic's
+        // `request-id` header vs. the client's `x-client-request-id`) is not a
+        // reason to give up: fall back to the positional rules below.
+        let by_id = resp.request_id.as_deref().and_then(|resp_request_id| {
+            requests
                 .iter()
-                .position(|req| req.request_id.as_deref() == Some(resp_request_id))?;
+                .position(|req| req.request_id.as_deref() == Some(resp_request_id))
+        });
+        let (req, confidence) = if let Some(pos) = by_id {
             (requests.remove(pos)?, 0.95)
         } else if requests.len() == 1 {
             (requests.pop_front()?, 0.75)
@@ -358,6 +363,10 @@ impl MaterializedView {
                 "response_usage",
                 confidence,
             );
+            *self
+                .response_usage_seen
+                .entry((pid, usage.input_tokens, usage.output_tokens))
+                .or_default() += 1;
             self.emit_token_usage(row.clone())?;
             usage_row = Some(row);
         }
@@ -398,6 +407,14 @@ impl MaterializedView {
                 let cache = json_i64(item, "cached_input_tokens");
                 let total = input + output + cache;
                 if total <= 0 {
+                    continue;
+                }
+                // Telemetry is sent after the call completes, so when the API
+                // response itself was captured its usage is already recorded.
+                if let Some(seen) = self.response_usage_seen.get_mut(&(pid, input, output))
+                    && *seen > 0
+                {
+                    *seen -= 1;
                     continue;
                 }
                 let model = item
@@ -1010,6 +1027,8 @@ fn metadata_user_session_id(body: &Value) -> Option<String> {
 fn finish_reason_from_body(body: &Value) -> Option<String> {
     string_at(body, &["finish_reason"])
         .or_else(|| string_at(body, &["stop_reason"]))
+        // Anthropic streaming: message_delta carries {"delta":{"stop_reason":...}}
+        .or_else(|| string_at(body, &["delta", "stop_reason"]))
         .or_else(|| string_at(body, &["choices", "0", "finish_reason"]))
         .or_else(|| string_at(body, &["candidates", "0", "finishReason"]))
         .or_else(|| finish_reason_from_sse(body))

@@ -761,6 +761,31 @@ pub fn import_recent(view: &mut MaterializedView, limit: usize) {
     import_into_view(view, &sessions);
 }
 
+/// Import sessions and their tool calls but not their LLM-call and token rows.
+/// Used when a recording already holds those calls from the API traffic, so
+/// the transcript's totals would count them a second time.
+pub fn import_into_view_without_usage(view: &mut MaterializedView, sessions: &[LocalSession]) {
+    for session in sessions {
+        view.upsert_session(&session_row(session));
+        for row in tool_rows(session) {
+            view.apply_tool_call(&row);
+        }
+    }
+}
+
+/// PIDs whose recorded file events touched this session's transcript.
+pub fn transcript_writer_pids(
+    session: &LocalSession,
+    audit_rows: &[AuditEventRow],
+) -> HashSet<u32> {
+    audit_rows
+        .iter()
+        .filter(|row| row.audit_type == "file")
+        .filter(|row| audit_file_paths(row).iter().any(|p| *p == session.path))
+        .filter_map(|row| row.pid)
+        .collect()
+}
+
 pub fn import_into_view(view: &mut MaterializedView, sessions: &[LocalSession]) {
     for session in sessions {
         view.upsert_session(&session_row(session));

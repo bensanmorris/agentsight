@@ -8,6 +8,7 @@ pub mod common;
 mod filter_base;
 mod filter_metrics;
 pub mod http_decompressor;
+mod http1_stream;
 pub mod http_filter;
 pub mod http_parser;
 pub mod materializing;

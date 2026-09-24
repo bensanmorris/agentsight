@@ -18,6 +18,10 @@ pub struct SSEProcessor {
     sse_buffers: Arc<Mutex<HashMap<String, SSEAccumulator>>>,
     timeout_ms: u64,
     max_buffers: usize,
+    /// Leave raw `ssl` events that carry a `conn_id` to the HTTP parser, which
+    /// reassembles them per connection. Set on the instance that runs before
+    /// the parser; accumulating those chunks here would take them away from it.
+    defer_connection_tracked_ssl: bool,
 }
 
 impl Default for SSEProcessor {
@@ -68,7 +72,14 @@ impl SSEProcessor {
             sse_buffers: Arc::new(Mutex::new(HashMap::new())),
             timeout_ms,
             max_buffers: MAX_BUFFERS,
+            defer_connection_tracked_ssl: false,
         }
+    }
+
+    /// See `defer_connection_tracked_ssl`.
+    pub fn defer_connection_tracked_ssl(mut self) -> Self {
+        self.defer_connection_tracked_ssl = true;
+        self
     }
 
     pub fn is_sse_data(data: &str) -> bool {
@@ -853,11 +864,18 @@ impl Analyzer for SSEProcessor {
         let sse_buffers = Arc::clone(&self.sse_buffers);
         let timeout_ms = self.timeout_ms;
         let max_buffers = self.max_buffers;
+        let defer_tracked = self.defer_connection_tracked_ssl;
 
         let processed_stream = stream.filter_map(move |event| {
             let buffers = Arc::clone(&sse_buffers);
 
             async move {
+                if defer_tracked
+                    && event.source == "ssl"
+                    && event.data.get("conn_id").and_then(|v| v.as_u64()).unwrap_or(0) != 0
+                {
+                    return Some(event);
+                }
                 let Some((data_str, allow_json_fragment)) = Self::sse_payload(&event) else {
                     return Some(event);
                 };
