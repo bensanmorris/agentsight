@@ -519,9 +519,14 @@ static uint32_t get_file_open_count(const struct event *e, uint64_t timestamp_ns
 	// Initialize warning message
 	warning_msg[0] = '\0';
 	
-	// Rate limiting check
+	// Rate limiting check. Only read-only opens are rate limited: write-intent
+	// opens (O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND) are the audit-relevant
+	// evidence and must not be dropped when a process has a burst of reads
+	// (e.g. an agent reading many files at startup, then writing one).
 	bool add_warning = false;
-	if (should_rate_limit_file(e, timestamp_ns, &add_warning)) {
+	bool write_intent = (e->file_op.flags & O_ACCMODE) != O_RDONLY ||
+			    (e->file_op.flags & (O_CREAT | O_TRUNC | O_APPEND));
+	if (!write_intent && should_rate_limit_file(e, timestamp_ns, &add_warning)) {
 		return 0;  // Drop this event
 	}
 	
