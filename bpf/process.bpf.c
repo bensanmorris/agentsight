@@ -222,7 +222,7 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 
 /* Syscall tracepoint for openat */
 SEC("tp/syscalls/sys_enter_openat")
-int trace_openat(struct trace_event_raw_sys_enter *ctx)
+int trace_openat(struct syscall_trace_enter *ctx)
 {
 	struct event *e;
 	pid_t pid;
@@ -272,7 +272,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 
 /* Syscall tracepoint for open */
 SEC("tp/syscalls/sys_enter_open")
-int trace_open(struct trace_event_raw_sys_enter *ctx)
+int trace_open(struct syscall_trace_enter *ctx)
 {
 	struct event *e;
 	pid_t pid;

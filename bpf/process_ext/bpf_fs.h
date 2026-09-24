@@ -74,13 +74,13 @@ static __always_inline int agg_path_event(const char *user_path, u32 event_type)
 /* --- unlink / unlinkat → FILE_DELETE --- */
 
 SEC("tp/syscalls/sys_enter_unlinkat")
-int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
+int trace_unlinkat(struct syscall_trace_enter *ctx)
 {
 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_FILE_DELETE);
 }
 
 SEC("tp/syscalls/sys_enter_unlink")
-int trace_unlink(struct trace_event_raw_sys_enter *ctx)
+int trace_unlink(struct syscall_trace_enter *ctx)
 {
 	return agg_path_event((const char *)ctx->args[0], EVENT_TYPE_FILE_DELETE);
 }
@@ -88,21 +88,21 @@ int trace_unlink(struct trace_event_raw_sys_enter *ctx)
 /* --- rename / renameat / renameat2 → FILE_RENAME --- */
 
 SEC("tp/syscalls/sys_enter_renameat2")
-int trace_renameat2(struct trace_event_raw_sys_enter *ctx)
+int trace_renameat2(struct syscall_trace_enter *ctx)
 {
 	/* newpath is args[3] */
 	return agg_path_event((const char *)ctx->args[3], EVENT_TYPE_FILE_RENAME);
 }
 
 SEC("tp/syscalls/sys_enter_renameat")
-int trace_renameat(struct trace_event_raw_sys_enter *ctx)
+int trace_renameat(struct syscall_trace_enter *ctx)
 {
 	/* renameat(olddirfd, oldpath, newdirfd, newpath): newpath is args[3] */
 	return agg_path_event((const char *)ctx->args[3], EVENT_TYPE_FILE_RENAME);
 }
 
 SEC("tp/syscalls/sys_enter_rename")
-int trace_rename(struct trace_event_raw_sys_enter *ctx)
+int trace_rename(struct syscall_trace_enter *ctx)
 {
 	/* rename(oldpath, newpath): newpath is args[1] */
 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_FILE_RENAME);
@@ -111,19 +111,19 @@ int trace_rename(struct trace_event_raw_sys_enter *ctx)
 /* --- mkdir / mkdirat → DIR_CREATE --- */
 
 SEC("tp/syscalls/sys_enter_mkdirat")
-int trace_mkdirat(struct trace_event_raw_sys_enter *ctx)
+int trace_mkdirat(struct syscall_trace_enter *ctx)
 {
 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_DIR_CREATE);
 }
 
 SEC("tp/syscalls/sys_enter_mkdir")
-int trace_mkdir(struct trace_event_raw_sys_enter *ctx)
+int trace_mkdir(struct syscall_trace_enter *ctx)
 {
 	return agg_path_event((const char *)ctx->args[0], EVENT_TYPE_DIR_CREATE);
 }
 
 SEC("tp/syscalls/sys_enter_ftruncate")
-int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
+int trace_ftruncate(struct syscall_trace_enter *ctx)
 {
 	if (!trace_fs_mutations)
 		return 0;
@@ -142,7 +142,7 @@ int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tp/syscalls/sys_enter_chdir")
-int trace_chdir(struct trace_event_raw_sys_enter *ctx)
+int trace_chdir(struct syscall_trace_enter *ctx)
 {
 	if (!trace_fs_mutations)
 		return 0;

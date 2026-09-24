@@ -44,7 +44,7 @@ static __always_inline int write_str(char *buf, int pos, int buf_len, const char
 }
 
 SEC("tp/syscalls/sys_enter_setpgid")
-int trace_setpgid(struct trace_event_raw_sys_enter *ctx)
+int trace_setpgid(struct syscall_trace_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;
@@ -70,7 +70,7 @@ int trace_setpgid(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tp/syscalls/sys_enter_setsid")
-int trace_setsid(struct trace_event_raw_sys_enter *ctx)
+int trace_setsid(struct syscall_trace_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;
@@ -93,7 +93,7 @@ int trace_setsid(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tp/syscalls/sys_enter_kill")
-int trace_kill(struct trace_event_raw_sys_enter *ctx)
+int trace_kill(struct syscall_trace_enter *ctx)
 {
 	if (!trace_signals)
 		return 0;

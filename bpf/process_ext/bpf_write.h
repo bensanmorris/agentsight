@@ -50,37 +50,37 @@ static __always_inline int trace_write_exit_common(long ret)
 }
 
 SEC("tp/syscalls/sys_enter_write")
-int trace_write_enter(struct trace_event_raw_sys_enter *ctx)
+int trace_write_enter(struct syscall_trace_enter *ctx)
 {
 	return trace_write_enter_common((int)ctx->args[0]);
 }
 
 SEC("tp/syscalls/sys_exit_write")
-int trace_write_exit(struct trace_event_raw_sys_exit *ctx)
+int trace_write_exit(struct syscall_trace_exit *ctx)
 {
 	return trace_write_exit_common(ctx->ret);
 }
 
 SEC("tp/syscalls/sys_enter_pwrite64")
-int trace_pwrite64_enter(struct trace_event_raw_sys_enter *ctx)
+int trace_pwrite64_enter(struct syscall_trace_enter *ctx)
 {
 	return trace_write_enter_common((int)ctx->args[0]);
 }
 
 SEC("tp/syscalls/sys_exit_pwrite64")
-int trace_pwrite64_exit(struct trace_event_raw_sys_exit *ctx)
+int trace_pwrite64_exit(struct syscall_trace_exit *ctx)
 {
 	return trace_write_exit_common(ctx->ret);
 }
 
 SEC("tp/syscalls/sys_enter_writev")
-int trace_writev_enter(struct trace_event_raw_sys_enter *ctx)
+int trace_writev_enter(struct syscall_trace_enter *ctx)
 {
 	return trace_write_enter_common((int)ctx->args[0]);
 }
 
 SEC("tp/syscalls/sys_exit_writev")
-int trace_writev_exit(struct trace_event_raw_sys_exit *ctx)
+int trace_writev_exit(struct syscall_trace_exit *ctx)
 {
 	return trace_write_exit_common(ctx->ret);
 }

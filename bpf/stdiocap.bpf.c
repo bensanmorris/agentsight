@@ -148,25 +148,25 @@ static __always_inline int exit_common(long ret)
 }
 
 SEC("tp/syscalls/sys_enter_read")
-int trace_enter_read(struct trace_event_raw_sys_enter *ctx)
+int trace_enter_read(struct syscall_trace_enter *ctx)
 {
 	return enter_common((int)ctx->args[0], (const void *)ctx->args[1], true);
 }
 
 SEC("tp/syscalls/sys_exit_read")
-int trace_exit_read(struct trace_event_raw_sys_exit *ctx)
+int trace_exit_read(struct syscall_trace_exit *ctx)
 {
 	return exit_common(ctx->ret);
 }
 
 SEC("tp/syscalls/sys_enter_write")
-int trace_enter_write(struct trace_event_raw_sys_enter *ctx)
+int trace_enter_write(struct syscall_trace_enter *ctx)
 {
 	return enter_common((int)ctx->args[0], (const void *)ctx->args[1], false);
 }
 
 SEC("tp/syscalls/sys_exit_write")
-int trace_exit_write(struct trace_event_raw_sys_exit *ctx)
+int trace_exit_write(struct syscall_trace_exit *ctx)
 {
 	return exit_common(ctx->ret);
 }

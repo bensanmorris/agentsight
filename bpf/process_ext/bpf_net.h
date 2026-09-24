@@ -9,7 +9,7 @@
  */
 
 /* Read sockaddr_in from userspace and format as "A.B.C.D:PORT" */
-static __always_inline void read_and_format_sockaddr(struct trace_event_raw_sys_enter *ctx,
+static __always_inline void read_and_format_sockaddr(struct syscall_trace_enter *ctx,
 						     char *detail, int detail_len)
 {
 	struct sockaddr_in addr = {};
@@ -51,7 +51,7 @@ static __always_inline void format_family(char *buf, int buf_len, u16 family)
 }
 
 SEC("tp/syscalls/sys_enter_bind")
-int trace_bind(struct trace_event_raw_sys_enter *ctx)
+int trace_bind(struct syscall_trace_enter *ctx)
 {
 	if (!trace_network)
 		return 0;
@@ -76,7 +76,7 @@ int trace_bind(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tp/syscalls/sys_enter_listen")
-int trace_listen(struct trace_event_raw_sys_enter *ctx)
+int trace_listen(struct syscall_trace_enter *ctx)
 {
 	if (!trace_network)
 		return 0;
@@ -95,7 +95,7 @@ int trace_listen(struct trace_event_raw_sys_enter *ctx)
 }
 
 SEC("tp/syscalls/sys_enter_connect")
-int trace_connect(struct trace_event_raw_sys_enter *ctx)
+int trace_connect(struct syscall_trace_enter *ctx)
 {
 	if (!trace_network)
 		return 0;

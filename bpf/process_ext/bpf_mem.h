@@ -8,7 +8,7 @@
  */
 
 SEC("tp/syscalls/sys_enter_mmap")
-int trace_mmap(struct trace_event_raw_sys_enter *ctx)
+int trace_mmap(struct syscall_trace_enter *ctx)
 {
 	if (!trace_memory)
 		return 0;
