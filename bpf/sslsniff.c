@@ -554,6 +554,32 @@ char *find_library_path(const char *libname) {
 	return NULL;
 }
 
+/* Report ring buffer drops (events lost because the ring was full) to stderr.
+ * Prints when the total increases, at most every 5 seconds, and once at exit. */
+static void report_ringbuf_drops(int fd, bool final)
+{
+	static unsigned long long reported = 0;
+	static time_t last = 0;
+	int ncpus = libbpf_num_possible_cpus();
+	unsigned long long total = 0;
+	__u32 key = 0;
+	time_t now = time(NULL);
+
+	if (fd < 0 || ncpus <= 0 || (!final && now - last < 5))
+		return;
+	last = now;
+	unsigned long long vals[ncpus];
+	if (bpf_map_lookup_elem(fd, &key, vals))
+		return;
+	for (int i = 0; i < ncpus; i++)
+		total += vals[i];
+	if (total > reported || (final && total > 0)) {
+		fprintf(stderr, "sslsniff: ring buffer full, dropped %llu events (total %llu)%s\n",
+			total - reported, total, final ? " at exit" : "");
+		reported = total;
+	}
+}
+
 // Global buffer allocated once and reused
 static char *event_buf = NULL;
 
@@ -673,6 +699,7 @@ int main(int argc, char **argv) {
 	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
 	struct sslsniff_bpf *obj = NULL;
 	struct ring_buffer *rb = NULL;
+	int drops_fd = -1;
 	struct codex_rustls_offsets codex_offsets = {};
 	bool is_codex = false;
 	bool codex_rustls = false;
@@ -848,6 +875,7 @@ int main(int argc, char **argv) {
 		goto cleanup;
 	}
 
+	drops_fd = bpf_map__fd(obj->maps.ringbuf_drops);
 	while (!exiting) {
 		err = ring_buffer__poll(rb, PERF_POLL_TIMEOUT_MS);
 		if (err < 0 && err != -EINTR) {
@@ -855,7 +883,9 @@ int main(int argc, char **argv) {
 			goto cleanup;
 		}
 		err = 0;
+		report_ringbuf_drops(drops_fd, false);
 	}
+	report_ringbuf_drops(drops_fd, true);
 
 cleanup:
 	if (grok_rustls_link)

@@ -48,6 +48,24 @@ struct {
     __type(value, __u64);
 } bufs SEC(".maps");
 
+/* Count events dropped because the ring buffer was full. Every event reserves
+ * sizeof(struct probe_SSL_data_t) (~256KB), so a slow consumer can exhaust the
+ * 16MB ring quickly; without this counter those drops are silent. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} ringbuf_drops SEC(".maps");
+
+static __always_inline void count_ringbuf_drop(void)
+{
+    u32 key = 0;
+    u64 *val = bpf_map_lookup_elem(&ringbuf_drops, &key);
+    if (val)
+        (*val)++;
+}
+
 const volatile pid_t targ_pid = 0;
 const volatile uid_t targ_uid = -1;
 #define MAX_RUSTLS_IOVECS 2
@@ -149,8 +167,10 @@ int BPF_UPROBE(probe_rustls_write, void *conn, const void *buf, size_t len)
     if (!trace_allowed(uid, pid) || !buf || len == 0)
         return 0;
     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
     if (bpf_probe_read_user(data->buf, copied, buf)) {
         bpf_ringbuf_discard(data, 0);
         return 0;
@@ -174,8 +194,10 @@ int BPF_UPROBE(probe_rustls_write_vectored, void *conn,
         return 0;
 
     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
 
 #pragma unroll
     for (int i = 0; i < MAX_RUSTLS_IOVECS; i++) {
@@ -240,8 +262,10 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
             ? GROK_MAX_CAPTURE_SIZE : (u32)total;
         struct probe_SSL_data_t *data =
             bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-        if (!data)
+        if (!data) {
+            count_ringbuf_drop();
             return 0;
+        }
         if (bpf_probe_read_user(data->buf, copied, outbound.data)) {
             bpf_ringbuf_discard(data, 0);
             return 0;
@@ -258,8 +282,10 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
 
     struct probe_SSL_data_t *data =
         bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
 
 #pragma unroll
     for (int i = 0; i < MAX_GROK_IOVECS; i++) {
@@ -331,8 +357,10 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
 
     /* reserve space in ring buffer */
     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
 
     data->timestamp_ns = ts;
     data->delta_ns = delta_ns;
@@ -444,8 +472,10 @@ static int ex_SSL_exit(struct pt_regs *ctx, int rw, int len) {
 
     /* reserve space in ring buffer */
     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
 
     data->timestamp_ns = ts;
     data->delta_ns = delta_ns;
@@ -566,8 +596,10 @@ int BPF_URETPROBE(probe_SSL_do_handshake_exit) {
 
     /* reserve space in ring buffer */
     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if (!data)
+    if (!data) {
+        count_ringbuf_drop();
         return 0;
+    }
 
     data->timestamp_ns = ts;
     data->delta_ns = ts - *tsp;
