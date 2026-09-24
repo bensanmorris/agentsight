@@ -25,6 +25,7 @@
 struct probe_SSL_data_t {
     __u64 timestamp_ns;
     __u64 delta_ns;
+    __u64 conn_id;          // SSL*/connection pointer: identifies the TLS connection (0 = unknown)
     __u32 pid;
     __u32 tid;
     __u32 uid;

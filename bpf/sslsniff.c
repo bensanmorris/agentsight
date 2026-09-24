@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -581,6 +582,21 @@ static void report_ringbuf_drops(int fd, bool final)
 }
 
 // Global buffer allocated once and reused
+
+/* True when json_print_escaped() + a byte-per-char decoder can't reproduce buf
+ * exactly: valid UTF-8 sequences are emitted raw and decode to code points, so
+ * any byte >= 0x80 (or an escaped control byte) makes the text form ambiguous. */
+static bool needs_exact_bytes(const unsigned char *buf, unsigned int len)
+{
+	for (unsigned int i = 0; i < len; i++) {
+		unsigned char c = buf[i];
+
+		if (c >= 0x80 || (c < 0x20 && c != '\r' && c != '\n' && c != '\t'))
+			return true;
+	}
+	return false;
+}
+
 static char *event_buf = NULL;
 
 // Function to print the event from the perf buffer in JSON format
@@ -640,6 +656,7 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	// Always include extra fields (UID, TID)
 	printf("\"uid\":%d,", event->uid);
 	printf("\"tid\":%d,", event->tid);
+	printf("\"conn_id\":%llu,", (unsigned long long)event->conn_id);
 
 	// Always include latency field
 	if (event->delta_ns) {
@@ -657,8 +674,13 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 		printf("\"data\":");
 		json_print_escaped_quoted(event_buf, buf_size);
 		printf(",");
-		if (buf_size >= 2 && (event_buf[0] & 0x80) && !(event_buf[0] & 0x30)
-		    && (event_buf[0] & 0x0f) <= 2 && (event_buf[1] & 0x80)) {
+		/* Exact bytes whenever the JSON text form can't round-trip: masked
+		 * WebSocket frames, and any buffer with bytes >= 0x80 or control bytes
+		 * other than CR/LF/TAB (compressed bodies, binary, Latin-1 text).
+		 * Consumers must prefer data_hex over data when it is present. */
+		if (needs_exact_bytes((const unsigned char *)event_buf, buf_size)
+		    || (buf_size >= 2 && (event_buf[0] & 0x80) && !(event_buf[0] & 0x30)
+		    && (event_buf[0] & 0x0f) <= 2 && (event_buf[1] & 0x80))) {
 			printf("\"data_hex\":\"");
 			for (unsigned int i = 0; i < buf_size; i++)
 				printf("%02x", (unsigned char)event_buf[i]);

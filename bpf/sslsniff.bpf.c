@@ -48,6 +48,17 @@ struct {
     __type(value, __u64);
 } bufs SEC(".maps");
 
+/* SSL* (or rustls connection) pointer from the entry probe, keyed by tid, so
+ * each event can say which TLS connection it belongs to. Runtimes such as Bun
+ * multiplex several connections on one thread, so pid:tid alone can't be used
+ * to reassemble HTTP streams. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u64);
+} ssl_ptrs SEC(".maps");
+
 /* Count events dropped because the ring buffer was full. Every event reserves
  * sizeof(struct probe_SSL_data_t) (~256KB), so a slow consumer can exhaust the
  * 16MB ring quickly; without this counter those drops are silent. */
@@ -109,10 +120,11 @@ static __always_inline bool trace_allowed(u32 uid, u32 pid)
 
 static __always_inline void submit_rustls_write(struct probe_SSL_data_t *data,
                                                  u32 pid, u32 tid, u32 uid,
-                                                 u64 total, u32 copied)
+                                                 u64 total, u32 copied, u64 conn_id)
 {
     data->timestamp_ns = bpf_ktime_get_ns();
     data->delta_ns = 0;
+    data->conn_id = conn_id;
     data->pid = pid;
     data->tid = tid;
     data->uid = uid;
@@ -175,7 +187,7 @@ int BPF_UPROBE(probe_rustls_write, void *conn, const void *buf, size_t len)
         bpf_ringbuf_discard(data, 0);
         return 0;
     }
-    submit_rustls_write(data, pid, tid, uid, len, copied);
+    submit_rustls_write(data, pid, tid, uid, len, copied, (u64)conn);
     return 0;
 }
 
@@ -232,7 +244,7 @@ int BPF_UPROBE(probe_rustls_write_vectored, void *conn,
 
     if (iovcnt > MAX_RUSTLS_IOVECS && total <= copied)
         total = (__u64)copied + 1;
-    submit_rustls_write(data, pid, tid, uid, total, copied);
+    submit_rustls_write(data, pid, tid, uid, total, copied, (u64)conn);
     return 0;
 }
 
@@ -270,7 +282,7 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
             bpf_ringbuf_discard(data, 0);
             return 0;
         }
-        submit_rustls_write(data, pid, tid, uid, total, copied);
+        submit_rustls_write(data, pid, tid, uid, total, copied, (u64)state);
         return 0;
     }
 
@@ -307,7 +319,7 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
         bpf_ringbuf_discard(data, 0);
         return 0;
     }
-    submit_rustls_write(data, pid, tid, uid, total, copied);
+    submit_rustls_write(data, pid, tid, uid, total, copied, (u64)state);
     return 0;
 }
 
@@ -324,6 +336,8 @@ int BPF_UPROBE(probe_SSL_rw_enter, void *ssl, void *buf, int num) {
     }
 
     /* store arg info for later lookup */
+    u64 ssl_ptr = (u64)ssl;
+    bpf_map_update_elem(&ssl_ptrs, &tid, &ssl_ptr, BPF_ANY);
     bpf_map_update_elem(&bufs, &tid, &buf, BPF_ANY);
     bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
     return 0;
@@ -364,6 +378,8 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
 
     data->timestamp_ns = ts;
     data->delta_ns = delta_ns;
+    u64 *sslp = bpf_map_lookup_elem(&ssl_ptrs, &tid);
+    data->conn_id = sslp ? *sslp : 0;
     data->pid = pid;
     data->tid = tid;
     data->uid = uid;
@@ -379,6 +395,7 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
     if (bufp != 0)
         ret = bpf_probe_read_user(&data->buf, buf_copy_size, (char *)*bufp);
 
+    bpf_map_delete_elem(&ssl_ptrs, &tid);
     bpf_map_delete_elem(&bufs, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
 
@@ -417,6 +434,8 @@ int BPF_UPROBE(probe_SSL_write_ex_enter, void *ssl, void *buf, size_t num, size_
         return 0;
     }
 
+    u64 ssl_ptr = (u64)ssl;
+    bpf_map_update_elem(&ssl_ptrs, &tid, &ssl_ptr, BPF_ANY);
     bpf_map_update_elem(&bufs, &tid, &buf, BPF_ANY);
     bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY); 
     
@@ -437,6 +456,8 @@ int BPF_UPROBE(probe_SSL_read_ex_enter, void *ssl, void *buf, size_t num, size_t
         return 0;
     }
 
+    u64 ssl_ptr = (u64)ssl;
+    bpf_map_update_elem(&ssl_ptrs, &tid, &ssl_ptr, BPF_ANY);
     bpf_map_update_elem(&bufs, &tid, &buf, BPF_ANY);
     bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY); 
 
@@ -479,6 +500,8 @@ static int ex_SSL_exit(struct pt_regs *ctx, int rw, int len) {
 
     data->timestamp_ns = ts;
     data->delta_ns = delta_ns;
+    u64 *sslp = bpf_map_lookup_elem(&ssl_ptrs, &tid);
+    data->conn_id = sslp ? *sslp : 0;
     data->pid = pid;
     data->tid = tid;
     data->uid = uid;
@@ -499,6 +522,7 @@ static int ex_SSL_exit(struct pt_regs *ctx, int rw, int len) {
     if (bufp != 0)
         ret = bpf_probe_read_user(&data->buf, buf_copy_size, (char *)*bufp);
 
+    bpf_map_delete_elem(&ssl_ptrs, &tid);
     bpf_map_delete_elem(&bufs, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
 
@@ -603,6 +627,7 @@ int BPF_URETPROBE(probe_SSL_do_handshake_exit) {
 
     data->timestamp_ns = ts;
     data->delta_ns = ts - *tsp;
+    data->conn_id = 0;
     data->pid = pid;
     data->tid = tid;
     data->uid = uid;
