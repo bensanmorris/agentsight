@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include "process.h"
 #include "process.skel.h"
 #include "process_utils.h"
@@ -759,6 +760,53 @@ static int seed_initial_pids(struct pid_tracker *tracker)
 	return tracked_count;
 }
 
+/*
+ * Make a FILE_OPEN path absolute, from the target process's point of view:
+ *   /proc/self/fd/N/rest  -> readlink(/proc/<pid>/fd/N) + /rest
+ *   relative, dfd=AT_FDCWD -> readlink(/proc/<pid>/cwd) + /path
+ *   relative, dfd>=0       -> readlink(/proc/<pid>/fd/<dfd>) + /path
+ * Best effort: if the link can't be read (fd closed, process gone), or the
+ * result doesn't fit, the original path is kept.
+ */
+static void resolve_open_path(struct event *e)
+{
+	char link[64], base[PATH_MAX], out[PATH_MAX];
+	const char *path = e->file_op.filepath;
+	const char *rest = NULL;
+	ssize_t n;
+
+	if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+		char *end;
+		long fd = strtol(path + 14, &end, 10);
+		if (end == path + 14 || (*end != '/' && *end != '\0'))
+			return;
+		snprintf(link, sizeof(link), "/proc/%d/fd/%ld", e->pid, fd);
+		rest = end;  /* "" or "/..." */
+	} else if (path[0] != '/' && path[0] != '\0') {
+		if (e->file_op.fd == AT_FDCWD)
+			snprintf(link, sizeof(link), "/proc/%d/cwd", e->pid);
+		else if (e->file_op.fd >= 0)
+			snprintf(link, sizeof(link), "/proc/%d/fd/%d", e->pid, e->file_op.fd);
+		else
+			return;
+		rest = NULL;
+	} else {
+		return;
+	}
+
+	n = readlink(link, base, sizeof(base) - 1);
+	if (n <= 0)
+		return;
+	base[n] = '\0';
+	if (rest)
+		n = snprintf(out, sizeof(out), "%s%s", base, rest);
+	else
+		n = snprintf(out, sizeof(out), "%s/%s", base, path);
+	if (n <= 0 || (size_t)n >= sizeof(e->file_op.filepath))
+		return;  /* keep the original rather than truncate */
+	memcpy(e->file_op.filepath, out, (size_t)n + 1);
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	const struct event *e = data;
@@ -844,9 +892,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				break;
 			}
 
+			// Resolve /proc/self/fd/N/... and dirfd/cwd-relative paths to
+			// absolute paths before dedup and reporting.
+			struct event resolved = *e;
+			resolve_open_path(&resolved);
+
 			// Get count for this FILE_OPEN operation
 			char warning_msg[128];
-			uint32_t count = get_file_open_count(e, e->timestamp_ns, warning_msg, sizeof(warning_msg));
+			uint32_t count = get_file_open_count(&resolved, resolved.timestamp_ns, warning_msg, sizeof(warning_msg));
 
 			// Skip if this is a duplicate (count == 0)
 			if (count == 0) {
@@ -854,7 +907,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			}
 
 			// Report the FILE_OPEN event with count
-			print_file_open_event(e, e->timestamp_ns, count, strlen(warning_msg) > 0 ? warning_msg : NULL);
+			print_file_open_event(&resolved, resolved.timestamp_ns, count, strlen(warning_msg) > 0 ? warning_msg : NULL);
 			break;
 
 		default:

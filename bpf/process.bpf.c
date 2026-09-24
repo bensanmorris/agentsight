@@ -224,104 +224,106 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	return 0;
 }
 
-/* Syscall tracepoint for openat */
-SEC("tp/syscalls/sys_enter_openat")
-int trace_openat(struct syscall_trace_enter *ctx)
+/*
+ * open()/openat() capture. The filename is read at syscall *exit*, not entry:
+ * at entry the user string may not be paged in yet, bpf_probe_read_user_str()
+ * cannot fault it in, and the event used to be dropped silently. By exit the
+ * kernel has copied the string, so the page is resident. The entry handlers
+ * only stash the arguments.
+ */
+struct open_args_t {
+	u64 filename;
+	int flags;
+	int dfd;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 10240);
+	__type(key, u64);
+	__type(value, struct open_args_t);
+} open_args SEC(".maps");
+
+static __always_inline int stash_open_args(int dfd, const char *filename, int flags)
 {
-	struct event *e;
-	pid_t pid;
-	char filepath[MAX_FILENAME_LEN];
-	int dfd, flags;
-	const char *filename;
+	struct open_args_t args = {};
+	u64 id;
 
 	if (!is_cgroup_tracked())
 		return 0;
-
-	pid = bpf_get_current_pid_tgid() >> 32;
-
-	/* Get syscall arguments */
-	dfd = (int)ctx->args[0];
-	filename = (const char *)ctx->args[1];
-	flags = (int)ctx->args[2];
-
-	/* Read filename from user space */
-	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
-		return 0;
-
-	/* Reserve sample from BPF ringbuf */
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	/* Fill out the event */
-	e->type = EVENT_TYPE_FILE_OPERATION;
-	e->pid = pid;
-	e->ppid = 0; /* Will be filled if needed */
-	e->exit_code = 0;
-	e->duration_ns = 0;
-	e->timestamp_ns = bpf_ktime_get_ns();
-	e->exit_event = false;
-	bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-	/* Copy filepath and set file open details */
-	bpf_probe_read_kernel_str(e->file_op.filepath, sizeof(e->file_op.filepath), filepath);
-	e->file_op.fd = -1; /* Will be set on return if needed */
-	e->file_op.flags = flags;
-	e->file_op.is_open = true;
-
-	/* Submit to user-space */
-	bpf_ringbuf_submit(e, 0);
+	id = bpf_get_current_pid_tgid();
+	args.filename = (u64)filename;
+	args.flags = flags;
+	args.dfd = dfd;
+	bpf_map_update_elem(&open_args, &id, &args, BPF_ANY);
 	return 0;
 }
 
-/* Syscall tracepoint for open */
-SEC("tp/syscalls/sys_enter_open")
-int trace_open(struct syscall_trace_enter *ctx)
+static __always_inline int emit_open_event(void)
 {
+	u64 id = bpf_get_current_pid_tgid();
+	struct open_args_t *args;
 	struct event *e;
-	pid_t pid;
-	char filepath[MAX_FILENAME_LEN];
-	int flags;
-	const char *filename;
 
-	if (!is_cgroup_tracked())
+	args = bpf_map_lookup_elem(&open_args, &id);
+	if (!args)
 		return 0;
 
-	pid = bpf_get_current_pid_tgid() >> 32;
-
-	/* Get syscall arguments */
-	filename = (const char *)ctx->args[0];
-	flags = (int)ctx->args[1];
-
-	/* Read filename from user space */
-	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
-		return 0;
-
-	/* Reserve sample from BPF ringbuf */
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		bpf_map_delete_elem(&open_args, &id);
 		return 0;
+	}
+	if (bpf_probe_read_user_str(e->file_op.filepath, sizeof(e->file_op.filepath),
+				    (const char *)args->filename) < 0) {
+		bpf_ringbuf_discard(e, 0);
+		bpf_map_delete_elem(&open_args, &id);
+		return 0;
+	}
 
-	/* Fill out the event */
 	e->type = EVENT_TYPE_FILE_OPERATION;
-	e->pid = pid;
+	e->pid = id >> 32;
 	e->ppid = 0;
 	e->exit_code = 0;
 	e->duration_ns = 0;
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->exit_event = false;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-	/* Copy filepath and set file open details */
-	bpf_probe_read_kernel_str(e->file_op.filepath, sizeof(e->file_op.filepath), filepath);
-	e->file_op.fd = -1;
-	e->file_op.flags = flags;
+	e->file_op.fd = args->dfd;   /* directory fd, for resolving relative paths */
+	e->file_op.flags = args->flags;
 	e->file_op.is_open = true;
 
-	/* Submit to user-space */
+	bpf_map_delete_elem(&open_args, &id);
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
+
+/* Syscall tracepoint for openat */
+SEC("tp/syscalls/sys_enter_openat")
+int trace_openat(struct syscall_trace_enter *ctx)
+{
+	return stash_open_args((int)ctx->args[0], (const char *)ctx->args[1], (int)ctx->args[2]);
+}
+
+SEC("tp/syscalls/sys_exit_openat")
+int trace_openat_exit(struct syscall_trace_exit *ctx)
+{
+	return emit_open_event();
+}
+
+/* Syscall tracepoint for open */
+SEC("tp/syscalls/sys_enter_open")
+int trace_open(struct syscall_trace_enter *ctx)
+{
+	return stash_open_args(-100 /* AT_FDCWD */, (const char *)ctx->args[0], (int)ctx->args[1]);
+}
+
+SEC("tp/syscalls/sys_exit_open")
+int trace_open_exit(struct syscall_trace_exit *ctx)
+{
+	return emit_open_event();
+}
+
 
 #include "process_ext/bpf_fs.h"
 #include "process_ext/bpf_write.h"
